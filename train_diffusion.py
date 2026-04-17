@@ -16,13 +16,13 @@ from models import DenoisingDiffusion
 
 def parse_args_and_config():
     parser = argparse.ArgumentParser(description='Training Patch-Based Denoising Diffusion Models')
-    parser.add_argument("--config", type=str, required=True,
+    parser.add_argument("--config", type=str, default="allweather.yml",
                         help="Path to the config file")
     parser.add_argument('--resume', default='', type=str,
                         help='Path for checkpoint to load and resume')
     parser.add_argument("--sampling_timesteps", type=int, default=25,
                         help="Number of implicit sampling steps for validation image patches")
-    parser.add_argument("--image_folder", default='results/images/', type=str,
+    parser.add_argument("--image_folder", default='../results/images/', type=str,
                         help="Location to save restored validation image patches")
     parser.add_argument('--seed', default=61, type=int, metavar='N',
                         help='Seed for initializing training (default: 61)')

@@ -1,22 +1,32 @@
-import torch
-import torch.nn as nn
-import utils
-import torchvision
+from __future__ import annotations
+
 import os
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+import torch
+
+import utils
 from utils.metrics import calculate_psnr_torch, calculate_ssim_torch
 
 
-def data_transform(X):
-    return 2 * X - 1.0
+__all__ = [
+    "data_transform",
+    "inverse_data_transform",
+    "DiffusiveRestoration",
+]
 
 
-def inverse_data_transform(X):
-    return torch.clamp((X + 1.0) / 2.0, 0.0, 1.0)
+def data_transform(x: torch.Tensor) -> torch.Tensor:
+    return 2.0 * x - 1.0
+
+
+def inverse_data_transform(x: torch.Tensor) -> torch.Tensor:
+    return torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
 
 
 class DiffusiveRestoration:
-    def __init__(self, diffusion, args, config):
-        super(DiffusiveRestoration, self).__init__()
+    def __init__(self, diffusion: Any, args: Any, config: Any) -> None:
         self.args = args
         self.config = config
         self.diffusion = diffusion
@@ -25,20 +35,22 @@ class DiffusiveRestoration:
             self.diffusion.load_ddm_ckpt(args.resume, ema=True)
             self.diffusion.model.eval()
         else:
-            print('Pre-trained diffusion model path is missing!')
+            raise FileNotFoundError("Pre-trained diffusion model path is missing.")
 
-    def restore(self, val_loader, validation='snow', r=None):
-        image_folder = os.path.join(self.args.image_folder, self.config.data.dataset, validation)
+    def restore(self, val_loader: Any, validation: str = "snow", r: int | None = None) -> Dict[str, float]:
+        image_folder = Path(self.args.image_folder) / self.config.data.dataset / validation
+        image_folder.mkdir(parents=True, exist_ok=True)
+
         cumulative_psnr = 0.0
         cumulative_ssim = 0.0
         image_count = 0
 
-        with torch.no_grad():
-            for i, (x, y) in enumerate(val_loader):
-                print(f"starting processing from image {y}")
+        with torch.inference_mode():
+            for _, (x, image_id) in enumerate(val_loader):
+                print(f"starting processing from image {image_id}")
                 x = x.flatten(start_dim=0, end_dim=1) if x.ndim == 5 else x
-                x_cond = x[:, :3, :, :].to(self.diffusion.device)
-                x_gt = x[:, 3:, :, :].to(self.diffusion.device)
+                x_cond = x[:, :3, :, :].to(self.diffusion.device, non_blocking=True)
+                x_gt = x[:, 3:, :, :].to(self.diffusion.device, non_blocking=True)
 
                 x_output = self.diffusive_restoration(x_cond, r=r)
                 x_output = inverse_data_transform(x_output)
@@ -51,23 +63,54 @@ class DiffusiveRestoration:
                 cumulative_ssim += batch_ssim.item() * batch_size
                 image_count += batch_size
 
-                print(f"image {y} -> PSNR: {batch_psnr.item():.4f}, SSIM: {batch_ssim.item():.4f}")
-                utils.logging.save_image(x_output, os.path.join(image_folder, f"{y}_output.png"))
+                print(f"image {image_id} -> PSNR: {batch_psnr.item():.4f}, SSIM: {batch_ssim.item():.4f}")
+                utils.logging.save_image(x_output, str(image_folder / f"{image_id}_output.png"))
 
-        if image_count > 0:
-            print(f"{validation} set average -> PSNR: {cumulative_psnr / image_count:.4f}, SSIM: {cumulative_ssim / image_count:.4f}")
+        if image_count == 0:
+            raise RuntimeError("Validation loader returned no images for restoration.")
 
-    def diffusive_restoration(self, x_cond, r=None):
-        p_size = self.config.data.image_size
-        h_list, w_list = self.overlapping_grid_indices(x_cond, output_size=p_size, r=r)
-        corners = [(i, j) for i in h_list for j in w_list]
-        x = torch.randn(x_cond.size(), device=self.diffusion.device)
-        x_output = self.diffusion.sample_image(x_cond, x, patch_locs=corners, patch_size=p_size)
-        return x_output
+        metrics = {
+            "psnr": cumulative_psnr / image_count,
+            "ssim": cumulative_ssim / image_count,
+            "num_images": float(image_count),
+        }
+        print(f"{validation} set average -> PSNR: {metrics['psnr']:.4f}, SSIM: {metrics['ssim']:.4f}")
+        return metrics
 
-    def overlapping_grid_indices(self, x_cond, output_size, r=None):
-        _, c, h, w = x_cond.shape
-        r = 16 if r is None else r
-        h_list = [i for i in range(0, h - output_size + 1, r)]
-        w_list = [i for i in range(0, w - output_size + 1, r)]
+    def diffusive_restoration(self, x_cond: torch.Tensor, r: int | None = None) -> torch.Tensor:
+        patch_size = int(self.config.data.image_size)
+        h_list, w_list = self.overlapping_grid_indices(x_cond, output_size=patch_size, r=r)
+        corners = [(h, w) for h in h_list for w in w_list]
+        x = torch.randn_like(x_cond, device=self.diffusion.device)
+        return self.diffusion.sample_image(x_cond, x, patch_locs=corners, patch_size=patch_size)
+
+    @staticmethod
+    def _cover_positions(limit: int, output_size: int, stride: int) -> List[int]:
+        if output_size > limit:
+            raise ValueError(
+                f"Patch size {output_size} cannot exceed image extent {limit}. "
+                "Reduce config.data.image_size or resize inputs before inference."
+            )
+        if output_size == limit:
+            return [0]
+
+        positions = list(range(0, limit - output_size + 1, stride))
+        last = limit - output_size
+        if positions[-1] != last:
+            positions.append(last)
+        return positions
+
+    def overlapping_grid_indices(
+        self,
+        x_cond: torch.Tensor,
+        output_size: int,
+        r: int | None = None,
+    ) -> Tuple[List[int], List[int]]:
+        _, _, h, w = x_cond.shape
+        stride = 16 if r is None else int(r)
+        if stride <= 0:
+            raise ValueError(f"Stride must be positive, but got {stride}.")
+
+        h_list = self._cover_positions(h, output_size, stride)
+        w_list = self._cover_positions(w, output_size, stride)
         return h_list, w_list
