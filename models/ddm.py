@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import os
 import time
 from pathlib import Path
@@ -55,17 +54,42 @@ class EMAHelper:
             if param.requires_grad:
                 self.shadow[name] = param.detach().clone()
 
+    def to(self, device: torch.device | str, dtype: Optional[torch.dtype] = None) -> None:
+        for name, tensor in self.shadow.items():
+            self.shadow[name] = tensor.to(
+                device=device,
+                dtype=dtype if dtype is not None else tensor.dtype,
+            )
+
     def update(self, module: nn.Module) -> None:
         module = unwrap_module(module)
         for name, param in module.named_parameters():
-            if param.requires_grad:
-                self.shadow[name].mul_(self.mu).add_(param.detach(), alpha=1.0 - self.mu)
+            if not param.requires_grad:
+                continue
+
+            if name not in self.shadow:
+                self.shadow[name] = param.detach().clone()
+                continue
+
+            shadow_param = self.shadow[name]
+            if shadow_param.device != param.device or shadow_param.dtype != param.dtype:
+                shadow_param = shadow_param.to(device=param.device, dtype=param.dtype)
+                self.shadow[name] = shadow_param
+
+            shadow_param.mul_(self.mu).add_(param.detach(), alpha=1.0 - self.mu)
 
     def ema(self, module: nn.Module) -> None:
         module = unwrap_module(module)
         for name, param in module.named_parameters():
-            if param.requires_grad:
-                param.data.copy_(self.shadow[name].data)
+            if not param.requires_grad:
+                continue
+
+            shadow_param = self.shadow[name]
+            if shadow_param.device != param.device or shadow_param.dtype != param.dtype:
+                shadow_param = shadow_param.to(device=param.device, dtype=param.dtype)
+                self.shadow[name] = shadow_param
+
+            param.data.copy_(shadow_param.data)
 
     def ema_copy(self, module: nn.Module) -> nn.Module:
         inner_module = unwrap_module(module)
@@ -78,7 +102,7 @@ class EMAHelper:
         return self.shadow
 
     def load_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
-        self.shadow = state_dict
+        self.shadow = {name: tensor.clone() for name, tensor in state_dict.items()}
 
 
 def get_beta_schedule(
@@ -105,7 +129,12 @@ def get_beta_schedule(
     elif beta_schedule == "const":
         betas = beta_end * np.ones(num_diffusion_timesteps, dtype=np.float64)
     elif beta_schedule == "jsd":
-        betas = 1.0 / np.linspace(num_diffusion_timesteps, 1, num_diffusion_timesteps, dtype=np.float64)
+        betas = 1.0 / np.linspace(
+            num_diffusion_timesteps,
+            1,
+            num_diffusion_timesteps,
+            dtype=np.float64,
+        )
     elif beta_schedule == "sigmoid":
         xs = np.linspace(-6, 6, num_diffusion_timesteps)
         betas = sigmoid(xs) * (beta_end - beta_start) + beta_start
@@ -147,6 +176,16 @@ def _create_grad_scaler(enabled: bool) -> torch.amp.GradScaler | torch.cuda.amp.
         return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
+def _move_optimizer_state_to_device(
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device=device, non_blocking=True)
+
+
 def noise_estimation_loss(
     model: nn.Module,
     x0: torch.Tensor,
@@ -169,7 +208,6 @@ def noise_estimation_loss(
     model_input = torch.cat([x_cond, x_t], dim=1)
     output = model(model_input, t.float())
 
-    # Resolution-invariant reduction.
     noise_loss = F.mse_loss(output, e, reduction="mean")
 
     denom = a.sqrt().clamp(min=1e-8)
@@ -206,7 +244,11 @@ class DenoisingDiffusion:
 
         use_compile = bool(getattr(config.model, "compile", False))
         use_data_parallel = bool(getattr(config.training, "use_data_parallel", True))
-        use_multi_gpu = self.device.type == "cuda" and torch.cuda.device_count() > 1 and use_data_parallel
+        use_multi_gpu = (
+            self.device.type == "cuda"
+            and torch.cuda.device_count() > 1
+            and use_data_parallel
+        )
 
         if use_compile and hasattr(torch, "compile") and not use_multi_gpu:
             base_model = torch.compile(base_model)
@@ -220,9 +262,15 @@ class DenoisingDiffusion:
         self.start_epoch = 0
         self.step = 0
 
-        use_amp = bool(getattr(config.training, "use_amp", False)) and self.device.type in {"cuda", "cpu"}
+        use_amp = bool(getattr(config.training, "use_amp", False)) and self.device.type in {
+            "cuda",
+            "cpu",
+        }
         self.use_amp = use_amp
-        self.amp_dtype = _resolve_amp_dtype(self.device, getattr(config.training, "amp_dtype", None))
+        self.amp_dtype = _resolve_amp_dtype(
+            self.device,
+            getattr(config.training, "amp_dtype", None),
+        )
         self.scaler = _create_grad_scaler(enabled=use_amp and self.device.type == "cuda")
 
         betas = get_beta_schedule(
@@ -246,13 +294,16 @@ class DenoisingDiffusion:
         self.model.to(self.device)
 
         self.optimizer.load_state_dict(checkpoint["optimizer"])
+        _move_optimizer_state_to_device(self.optimizer, self.device)
+
         self.ema_helper.load_state_dict(checkpoint["ema_helper"])
+        self.ema_helper.to(self.device)
 
         if ema:
             self.ema_helper.ema(self.model)
 
         print(f"=> loaded checkpoint '{load_path}' (epoch {self.start_epoch}, step {self.step})")
-        
+
     def _autocast_context(self):
         return torch.autocast(
             device_type=self.device.type,
@@ -274,7 +325,6 @@ class DenoisingDiffusion:
             },
             filename=str(ckpt_dir / f"{self.config.data.dataset}_ddpm"),
         )
-
 
     def train(self, dataset_builder: Any) -> None:
         if self.device.type == "cuda":
@@ -303,7 +353,12 @@ class DenoisingDiffusion:
                 x = data_transform(x)
                 e = torch.randn_like(x[:, 3:, :, :])
 
-                t = torch.randint(low=0, high=self.num_timesteps, size=(n // 2 + 1,), device=self.device)
+                t = torch.randint(
+                    low=0,
+                    high=self.num_timesteps,
+                    size=(n // 2 + 1,),
+                    device=self.device,
+                )
                 t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:n]
 
                 self.optimizer.zero_grad(set_to_none=True)
@@ -359,7 +414,13 @@ class DenoisingDiffusion:
         patch_locs: Optional[Sequence[Tuple[int, int]]] = None,
         patch_size: Optional[int] = None,
     ) -> torch.Tensor:
-        sample_steps = max(1, min(int(self.args.sampling_timesteps), self.config.diffusion.num_diffusion_timesteps))
+        sample_steps = max(
+            1,
+            min(
+                int(self.args.sampling_timesteps),
+                self.config.diffusion.num_diffusion_timesteps,
+            ),
+        )
         skip = max(1, self.config.diffusion.num_diffusion_timesteps // sample_steps)
         seq = range(0, self.config.diffusion.num_diffusion_timesteps, skip)
 
@@ -375,29 +436,40 @@ class DenoisingDiffusion:
                 p_size=patch_size,
             )
         else:
-            xs = utils.sampling.generalized_steps(x, x_cond, seq, self.model, self.betas, eta=0.0)
+            xs = utils.sampling.generalized_steps(
+                x,
+                x_cond,
+                seq,
+                self.model,
+                self.betas,
+                eta=0.0,
+            )
 
         return xs[0][-1] if last else xs
 
     def sample_validation_patches(self, val_loader: Iterable, step: int) -> None:
-        image_folder = Path(self.args.image_folder) / f"{self.config.data.dataset}{self.config.data.image_size}" / str(step)
+        image_folder = (
+            Path(self.args.image_folder)
+            / f"{self.config.data.dataset}{self.config.data.image_size}"
+            / str(step)
+        )
         image_folder.mkdir(parents=True, exist_ok=True)
-    
+
         with torch.inference_mode():
             try:
                 x, _ = next(iter(val_loader))
             except StopIteration:
                 print("Validation loader is empty; skipping validation sampling.")
                 return
-    
+
             print(f"Processing a single batch of validation images at step: {step}")
             x = x.flatten(start_dim=0, end_dim=1) if x.ndim == 5 else x
             n = x.size(0)
-    
+
             x_cond = x[:, :3, :, :].to(self.device, non_blocking=True)
             x_gt = x[:, 3:, :, :].to(self.device, non_blocking=True)
             x_cond_model = data_transform(x_cond)
-    
+
             noise = torch.randn(
                 n,
                 3,
@@ -405,18 +477,17 @@ class DenoisingDiffusion:
                 self.config.data.image_size,
                 device=self.device,
             )
-    
+
             x_pred = self.sample_image(x_cond_model, noise)
             x_pred = inverse_data_transform(x_pred)
-    
-            # force metric tensors to same device/dtype
+
             x_pred = x_pred.float()
             x_gt = x_gt.to(device=x_pred.device, dtype=x_pred.dtype, non_blocking=True)
-    
+
             val_psnr = calculate_psnr_torch(x_pred, x_gt)
             val_ssim = calculate_ssim_torch(x_pred, x_gt)
             print(f"validation step: {step}, psnr: {val_psnr.item():.4f}, ssim: {val_ssim.item():.4f}")
-    
+
             x_cond_vis = inverse_data_transform(x_cond_model)
             for idx in range(n):
                 utils.logging.save_image(x_cond_vis[idx], str(image_folder / f"{idx}_cond.png"))
