@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import time
 from pathlib import Path
@@ -129,12 +130,7 @@ def get_beta_schedule(
     elif beta_schedule == "const":
         betas = beta_end * np.ones(num_diffusion_timesteps, dtype=np.float64)
     elif beta_schedule == "jsd":
-        betas = 1.0 / np.linspace(
-            num_diffusion_timesteps,
-            1,
-            num_diffusion_timesteps,
-            dtype=np.float64,
-        )
+        betas = 1.0 / np.linspace(num_diffusion_timesteps, 1, num_diffusion_timesteps, dtype=np.float64)
     elif beta_schedule == "sigmoid":
         xs = np.linspace(-6, 6, num_diffusion_timesteps)
         betas = sigmoid(xs) * (beta_end - beta_start) + beta_start
@@ -196,8 +192,7 @@ def noise_estimation_loss(
     psnr_weight: float = 0.0,
     ssim_weight: float = 0.0,
 ) -> Dict[str, torch.Tensor]:
-    """Noise-prediction loss with optional image-space PSNR/SSIM auxiliaries.
-
+    """
     x0 is expected to be channel-concatenated as [condition, ground_truth].
     """
     a = alphas_cumprod.index_select(0, t).view(-1, 1, 1, 1)
@@ -244,11 +239,7 @@ class DenoisingDiffusion:
 
         use_compile = bool(getattr(config.model, "compile", False))
         use_data_parallel = bool(getattr(config.training, "use_data_parallel", True))
-        use_multi_gpu = (
-            self.device.type == "cuda"
-            and torch.cuda.device_count() > 1
-            and use_data_parallel
-        )
+        use_multi_gpu = self.device.type == "cuda" and torch.cuda.device_count() > 1 and use_data_parallel
 
         if use_compile and hasattr(torch, "compile") and not use_multi_gpu:
             base_model = torch.compile(base_model)
@@ -261,16 +252,11 @@ class DenoisingDiffusion:
         self.optimizer = utils.optimize.get_optimizer(self.config, self.model.parameters())
         self.start_epoch = 0
         self.step = 0
+        self.best_loss = float("inf")
 
-        use_amp = bool(getattr(config.training, "use_amp", False)) and self.device.type in {
-            "cuda",
-            "cpu",
-        }
+        use_amp = bool(getattr(config.training, "use_amp", False)) and self.device.type in {"cuda", "cpu"}
         self.use_amp = use_amp
-        self.amp_dtype = _resolve_amp_dtype(
-            self.device,
-            getattr(config.training, "amp_dtype", None),
-        )
+        self.amp_dtype = _resolve_amp_dtype(self.device, getattr(config.training, "amp_dtype", None))
         self.scaler = _create_grad_scaler(enabled=use_amp and self.device.type == "cuda")
 
         betas = get_beta_schedule(
@@ -284,11 +270,26 @@ class DenoisingDiffusion:
         self.alphas_cumprod = self.alphas.cumprod(dim=0)
         self.num_timesteps = self.betas.shape[0]
 
+        ckpt_dir = Path(self.config.data.data_dir) / "ckpts"
+        self.checkpoint_saver = utils.logging.CheckpointSaver(
+            save_dir=ckpt_dir,
+            prefix=f"{self.config.data.dataset}_ddpm",
+        )
+
+        plot_every_n_events = int(getattr(self.config.training, "plot_freq", 1))
+        trace_dir = Path(self.config.data.data_dir) / "training_logs"
+        self.metric_tracker = utils.logging.LiveMetricTracker(
+            log_dir=trace_dir,
+            prefix=f"{self.config.data.dataset}_ddpm",
+            plot_every_n_events=plot_every_n_events,
+        )
+
     def load_ddm_ckpt(self, load_path: str, ema: bool = False) -> None:
         checkpoint = utils.logging.load_checkpoint(load_path, device="cpu")
 
         self.start_epoch = int(checkpoint["epoch"])
         self.step = int(checkpoint["step"])
+        self.best_loss = float(checkpoint.get("best_loss", float("inf")))
 
         self.model.load_state_dict(checkpoint["state_dict"], strict=True)
         self.model.to(self.device)
@@ -302,7 +303,13 @@ class DenoisingDiffusion:
         if ema:
             self.ema_helper.ema(self.model)
 
-        print(f"=> loaded checkpoint '{load_path}' (epoch {self.start_epoch}, step {self.step})")
+        if math.isfinite(self.best_loss):
+            print(
+                f"=> loaded checkpoint '{load_path}' "
+                f"(epoch {self.start_epoch}, step {self.step}, best_loss {self.best_loss:.6f})"
+            )
+        else:
+            print(f"=> loaded checkpoint '{load_path}' (epoch {self.start_epoch}, step {self.step})")
 
     def _autocast_context(self):
         return torch.autocast(
@@ -311,20 +318,54 @@ class DenoisingDiffusion:
             enabled=self.use_amp,
         )
 
-    def _save_checkpoint(self, epoch: int) -> None:
-        ckpt_dir = Path(self.config.data.data_dir) / "ckpts"
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
+    def _build_checkpoint_state(self, epoch: int, current_loss: float) -> Dict[str, Any]:
+        return {
+            "epoch": int(epoch + 1),
+            "step": int(self.step),
+            "current_loss": float(current_loss),
+            "best_loss": float(self.best_loss),
+            "state_dict": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "ema_helper": self.ema_helper.state_dict(),
+        }
 
-        utils.logging.save_checkpoint(
-            {
-                "epoch": int(epoch + 1),
-                "step": int(self.step),
-                "state_dict": self.model.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-                "ema_helper": self.ema_helper.state_dict(),
-            },
-            filename=str(ckpt_dir / f"{self.config.data.dataset}_ddpm"),
+    def _save_snapshots(self, epoch: int, current_loss: float) -> None:
+        old_best_loss = self.best_loss
+        is_best = current_loss < old_best_loss
+
+        if is_best:
+            self.best_loss = current_loss
+
+        state = self._build_checkpoint_state(epoch, current_loss)
+        state["best_loss"] = float(self.best_loss)
+
+        last_path = self.checkpoint_saver.save_last(state)
+        best_updated, _, best_path = self.checkpoint_saver.save_best(
+            state,
+            current_loss=current_loss,
+            best_loss=old_best_loss,
         )
+
+        self.metric_tracker.log_snapshot(
+            epoch=epoch,
+            step=self.step,
+            current_loss=current_loss,
+            best_loss=self.best_loss,
+            is_best=is_best,
+        )
+
+        if best_updated:
+            print(
+                f"last snapshot saved: {last_path} | "
+                f"best snapshot updated: {best_path} | "
+                f"best model loss: {self.best_loss:.6f}"
+            )
+        else:
+            print(
+                f"last snapshot saved: {last_path} | "
+                f"best snapshot kept: {best_path} | "
+                f"best model loss: {self.best_loss:.6f}"
+            )
 
     def train(self, dataset_builder: Any) -> None:
         if self.device.type == "cuda":
@@ -353,12 +394,7 @@ class DenoisingDiffusion:
                 x = data_transform(x)
                 e = torch.randn_like(x[:, 3:, :, :])
 
-                t = torch.randint(
-                    low=0,
-                    high=self.num_timesteps,
-                    size=(n // 2 + 1,),
-                    device=self.device,
-                )
+                t = torch.randint(low=0, high=self.num_timesteps, size=(n // 2 + 1,), device=self.device)
                 t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:n]
 
                 self.optimizer.zero_grad(set_to_none=True)
@@ -385,23 +421,49 @@ class DenoisingDiffusion:
                 self.ema_helper.update(self.model)
 
                 if self.step % log_freq == 0:
+                    total_loss_value = float(loss.item())
+                    noise_loss_value = float(loss_dict["noise_loss"].item())
+                    psnr_loss_value = float(loss_dict["psnr_loss"].item())
+                    ssim_loss_value = float(loss_dict["ssim_loss"].item())
+                    psnr_value = float(loss_dict["psnr"].item())
+                    ssim_value = float(loss_dict["ssim"].item())
+
                     print(
                         f"step: {self.step}, "
-                        f"total_loss: {loss.item():.6f}, "
-                        f"noise_loss: {loss_dict['noise_loss'].item():.6f}, "
-                        f"psnr_loss: {loss_dict['psnr_loss'].item():.6f}, "
-                        f"ssim_loss: {loss_dict['ssim_loss'].item():.6f}, "
-                        f"psnr: {loss_dict['psnr'].item():.4f}, "
-                        f"ssim: {loss_dict['ssim'].item():.4f}, "
+                        f"total_loss: {total_loss_value:.6f}, "
+                        f"noise_loss: {noise_loss_value:.6f}, "
+                        f"psnr_loss: {psnr_loss_value:.6f}, "
+                        f"ssim_loss: {ssim_loss_value:.6f}, "
+                        f"psnr: {psnr_value:.4f}, "
+                        f"ssim: {ssim_value:.4f}, "
                         f"data_time: {data_time / (batch_idx + 1):.6f}"
+                    )
+
+                    self.metric_tracker.log_train(
+                        epoch=epoch,
+                        step=self.step,
+                        total_loss=total_loss_value,
+                        noise_loss=noise_loss_value,
+                        psnr_loss=psnr_loss_value,
+                        ssim_loss=ssim_loss_value,
+                        psnr=psnr_value,
+                        ssim=ssim_value,
                     )
 
                 if self.step % self.config.training.validation_freq == 0:
                     self.model.eval()
-                    self.sample_validation_patches(val_loader, self.step)
+                    val_metrics = self.sample_validation_patches(val_loader, self.step)
+
+                    if val_metrics is not None:
+                        self.metric_tracker.log_validation(
+                            epoch=epoch,
+                            step=self.step,
+                            psnr=float(val_metrics["psnr"]),
+                            ssim=float(val_metrics["ssim"]),
+                        )
 
                 if self.step % self.config.training.snapshot_freq == 0 or self.step == 1:
-                    self._save_checkpoint(epoch)
+                    self._save_snapshots(epoch, float(loss.item()))
 
                 data_start = time.time()
 
@@ -414,13 +476,7 @@ class DenoisingDiffusion:
         patch_locs: Optional[Sequence[Tuple[int, int]]] = None,
         patch_size: Optional[int] = None,
     ) -> torch.Tensor:
-        sample_steps = max(
-            1,
-            min(
-                int(self.args.sampling_timesteps),
-                self.config.diffusion.num_diffusion_timesteps,
-            ),
-        )
+        sample_steps = max(1, min(int(self.args.sampling_timesteps), self.config.diffusion.num_diffusion_timesteps))
         skip = max(1, self.config.diffusion.num_diffusion_timesteps // sample_steps)
         seq = range(0, self.config.diffusion.num_diffusion_timesteps, skip)
 
@@ -436,23 +492,12 @@ class DenoisingDiffusion:
                 p_size=patch_size,
             )
         else:
-            xs = utils.sampling.generalized_steps(
-                x,
-                x_cond,
-                seq,
-                self.model,
-                self.betas,
-                eta=0.0,
-            )
+            xs = utils.sampling.generalized_steps(x, x_cond, seq, self.model, self.betas, eta=0.0)
 
         return xs[0][-1] if last else xs
 
-    def sample_validation_patches(self, val_loader: Iterable, step: int) -> None:
-        image_folder = (
-            Path(self.args.image_folder)
-            / f"{self.config.data.dataset}{self.config.data.image_size}"
-            / str(step)
-        )
+    def sample_validation_patches(self, val_loader: Iterable, step: int) -> Optional[Dict[str, float]]:
+        image_folder = Path(self.args.image_folder) / f"{self.config.data.dataset}{self.config.data.image_size}" / str(step)
         image_folder.mkdir(parents=True, exist_ok=True)
 
         with torch.inference_mode():
@@ -460,7 +505,7 @@ class DenoisingDiffusion:
                 x, _ = next(iter(val_loader))
             except StopIteration:
                 print("Validation loader is empty; skipping validation sampling.")
-                return
+                return None
 
             print(f"Processing a single batch of validation images at step: {step}")
             x = x.flatten(start_dim=0, end_dim=1) if x.ndim == 5 else x
@@ -486,9 +531,18 @@ class DenoisingDiffusion:
 
             val_psnr = calculate_psnr_torch(x_pred, x_gt)
             val_ssim = calculate_ssim_torch(x_pred, x_gt)
-            print(f"validation step: {step}, psnr: {val_psnr.item():.4f}, ssim: {val_ssim.item():.4f}")
+
+            val_psnr_value = float(val_psnr.item())
+            val_ssim_value = float(val_ssim.item())
+
+            print(f"validation step: {step}, psnr: {val_psnr_value:.4f}, ssim: {val_ssim_value:.4f}")
 
             x_cond_vis = inverse_data_transform(x_cond_model)
             for idx in range(n):
                 utils.logging.save_image(x_cond_vis[idx], str(image_folder / f"{idx}_cond.png"))
                 utils.logging.save_image(x_pred[idx], str(image_folder / f"{idx}.png"))
+
+            return {
+                "psnr": val_psnr_value,
+                "ssim": val_ssim_value,
+            }

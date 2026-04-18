@@ -29,8 +29,8 @@ training:
     batch_size: 16
     n_epochs: 1775
     n_iters: 2000000
-    snapshot_freq: 100
-    validation_freq: 10000
+    snapshot_freq: 500
+    validation_freq: 5000
 
 sampling:
     batch_size: 1
