@@ -55,6 +55,10 @@ class DiffusiveRestoration:
                 x_output = self.diffusive_restoration(x_cond, r=r)
                 x_output = inverse_data_transform(x_output)
 
+                #############################################
+                #x_output = x_output.float()
+                #x_gt = x_gt.to(device=x_output.device, dtype=x_output.dtype, non_blocking=True)
+
                 batch_psnr = calculate_psnr_torch(x_output, x_gt)
                 batch_ssim = calculate_ssim_torch(x_output, x_gt)
 

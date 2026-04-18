@@ -237,16 +237,22 @@ class DenoisingDiffusion:
         self.num_timesteps = self.betas.shape[0]
 
     def load_ddm_ckpt(self, load_path: str, ema: bool = False) -> None:
-        checkpoint = utils.logging.load_checkpoint(load_path, None)
-        self.start_epoch = checkpoint["epoch"]
-        self.step = checkpoint["step"]
+        checkpoint = utils.logging.load_checkpoint(load_path, device="cpu")
+
+        self.start_epoch = int(checkpoint["epoch"])
+        self.step = int(checkpoint["step"])
+
         self.model.load_state_dict(checkpoint["state_dict"], strict=True)
+        self.model.to(self.device)
+
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.ema_helper.load_state_dict(checkpoint["ema_helper"])
+
         if ema:
             self.ema_helper.ema(self.model)
-        print(f"=> loaded checkpoint '{load_path}' (epoch {checkpoint['epoch']}, step {self.step})")
 
+        print(f"=> loaded checkpoint '{load_path}' (epoch {self.start_epoch}, step {self.step})")
+        
     def _autocast_context(self):
         return torch.autocast(
             device_type=self.device.type,
@@ -257,18 +263,18 @@ class DenoisingDiffusion:
     def _save_checkpoint(self, epoch: int) -> None:
         ckpt_dir = Path(self.config.data.data_dir) / "ckpts"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
+
         utils.logging.save_checkpoint(
             {
-                "epoch": epoch + 1,
-                "step": self.step,
+                "epoch": int(epoch + 1),
+                "step": int(self.step),
                 "state_dict": self.model.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
                 "ema_helper": self.ema_helper.state_dict(),
-                "params": self.args,
-                "config": self.config,
             },
             filename=str(ckpt_dir / f"{self.config.data.dataset}_ddpm"),
         )
+
 
     def train(self, dataset_builder: Any) -> None:
         if self.device.type == "cuda":
@@ -376,21 +382,22 @@ class DenoisingDiffusion:
     def sample_validation_patches(self, val_loader: Iterable, step: int) -> None:
         image_folder = Path(self.args.image_folder) / f"{self.config.data.dataset}{self.config.data.image_size}" / str(step)
         image_folder.mkdir(parents=True, exist_ok=True)
-
+    
         with torch.inference_mode():
             try:
                 x, _ = next(iter(val_loader))
             except StopIteration:
                 print("Validation loader is empty; skipping validation sampling.")
                 return
-
+    
             print(f"Processing a single batch of validation images at step: {step}")
             x = x.flatten(start_dim=0, end_dim=1) if x.ndim == 5 else x
             n = x.size(0)
+    
             x_cond = x[:, :3, :, :].to(self.device, non_blocking=True)
             x_gt = x[:, 3:, :, :].to(self.device, non_blocking=True)
             x_cond_model = data_transform(x_cond)
-
+    
             noise = torch.randn(
                 n,
                 3,
@@ -398,13 +405,18 @@ class DenoisingDiffusion:
                 self.config.data.image_size,
                 device=self.device,
             )
+    
             x_pred = self.sample_image(x_cond_model, noise)
             x_pred = inverse_data_transform(x_pred)
-
+    
+            # force metric tensors to same device/dtype
+            x_pred = x_pred.float()
+            x_gt = x_gt.to(device=x_pred.device, dtype=x_pred.dtype, non_blocking=True)
+    
             val_psnr = calculate_psnr_torch(x_pred, x_gt)
             val_ssim = calculate_ssim_torch(x_pred, x_gt)
             print(f"validation step: {step}, psnr: {val_psnr.item():.4f}, ssim: {val_ssim.item():.4f}")
-
+    
             x_cond_vis = inverse_data_transform(x_cond_model)
             for idx in range(n):
                 utils.logging.save_image(x_cond_vis[idx], str(image_folder / f"{idx}_cond.png"))
