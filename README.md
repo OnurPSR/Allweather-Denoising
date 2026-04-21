@@ -64,8 +64,6 @@ The resulting synthetic dataset, covering snow, rain, and fog, was used to train
 
 ## Implementation
 
-## Model Implementation
-
 This project implements a deep learning-based adverse weather removal pipeline designed for vehicle-camera imagery. The model learns a paired image-to-image restoration task, where the input is a synthetically degraded image under snow, rain, or fog conditions, and the target is the corresponding clean reference image captured under identical scene geometry.
 
 The implementation is organized to support:
@@ -79,7 +77,7 @@ The primary objective is to recover visually clean images while preserving scene
 
 ---
 
-### Training
+### Training & Evaluation
 
 Model training is performed on paired samples:
 
@@ -88,10 +86,30 @@ Model training is performed on paired samples:
 
 A configuration file controls the dataset paths, model hyperparameters, optimization settings, and logging behavior.
 
-#### Example Training Command
-
+#### 1. Install the requirements
 ```bash
-python train.py --config configs/allweather.yaml
+pip install -r requirements.txt
+```
+
+#### 2. Train the model based on the configuration file
+```bash
+python train_diffusion.py --config configs/allweather.yaml
+```
+
+#### 3. Evaluate the model
+```bash
+python eval_diffusion.py
+```
+
+
+## Results 
+
+| Weather Condition | SSIM | PSNR | 
+|---|---:|---:|
+| Snow | 0.9255 | 22.3760 dB |
+| Rain | 0.8702 | 24.3151 dB |
+| Fog | 0.9255 | 22.3760 dB |
+
 
 
 
