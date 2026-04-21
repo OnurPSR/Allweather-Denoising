@@ -106,7 +106,7 @@ python eval_diffusion.py
 
 | Weather Condition | SSIM | PSNR | 
 |---|---:|---:|
-| Snow | 0.9255 | 22.3760 dB |
+| Snow | 0.8124 | 21.4302 dB |
 | Rain | 0.8702 | 24.3151 dB |
 | Fog | 0.9255 | 22.3760 dB |
 
