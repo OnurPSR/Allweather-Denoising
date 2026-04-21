@@ -1,5 +1,5 @@
 # Allweather-Denoising
-
+![](assets/test-results.jpg)
 
 
 Adverse weather conditions can significantly degrade object detection performance in autonomous driving systems, leading to unreliable model decisions. This project addresses that problem by developing a generative AI-based image restoration filter designed to remove weather-related degradations from vehicle camera images.
