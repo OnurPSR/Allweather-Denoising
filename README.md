@@ -77,6 +77,35 @@ The primary objective is to recover visually clean images while preserving scene
 
 ---
 
+
+## Dataset Structure
+
+```text
+data/
+├── fog/
+│   └── test/
+│       ├── input/ 
+│       └── gt/
+├── rainfog/
+│   └── test/
+│       ├── input/
+│       └── gt/
+├── snow/
+│   └── test/
+│       ├── input/
+│       └── gt/
+└── allweather/
+    ├── fog/
+    │   ├── input/
+    │   └── gt/
+    ├── rainfog/
+    │   ├── input/
+    │   └── gt/
+    └── snow/
+        ├── input/
+        └── gt/
+```
+
 ### Training & Evaluation
 
 Model training is performed on paired samples:
@@ -85,6 +114,7 @@ Model training is performed on paired samples:
 - **target**: clean ground-truth image
 
 A configuration file controls the dataset paths, model hyperparameters, optimization settings, and logging behavior.
+
 
 #### 1. Install the requirements
 ```bash
@@ -98,7 +128,10 @@ python train_diffusion.py --config configs/allweather.yaml
 
 #### 3. Evaluate the model
 ```bash
-python eval_diffusion.py
+python evaluate.py \
+  --config configs/allweather.yaml \
+  --resume checkpoints/best.pth \
+  --test_set snow
 ```
 
 
@@ -110,6 +143,7 @@ python eval_diffusion.py
 | Rain | 0.8702 | 24.3151 dB |
 | Fog | 0.9255 | 22.3760 dB |
 
+## License
 
-
+This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details.
 
