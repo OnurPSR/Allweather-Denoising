@@ -6,7 +6,7 @@ Adverse weather conditions can significantly degrade object detection performanc
 
 
 ## Dataset Construction
-To keep the scope aligned with autonomous driving applications and improve model relevance, the study focuses exclusively on **in-vehicle camera data**. For snowy conditions, [VideoDesnowing](https://github.com/haoyuc/VideoDesnowing) dataset was used as the foundation. From this dataset, **22 distinct driving scenarios** were separated, each containing different environmental settings, camera perspectives, and in-car visual compositions. Based on the clean reference images, additional **synthetic adverse-weather dataset** was generated. Rainy images were synthesized using two distinct rain-generation models. [SyRaGAN](https://github.com/jaewoong1/SyRa-Synthesized_Rain_dataset) was applied to generate rain streaks with varying directions and densities without losing the consistency between streaks, while [VRGNet](https://github.com/hongwang01/VRGNet) was used to produce the broader atmospheric rain appearance at different density levels. Foggy images were generated using [FINet](https://github.com/zhangzhengde0225/FINet) under varying depth and density settings. The resulting dataset was further augmented through **[augmentation methods]** to increase sample diversity and improve the robustness and generalization performance of the model.
+To keep the scope aligned with autonomous driving applications and improve model relevance, the study focuses exclusively on **in-vehicle camera data**. For snowy conditions, [VideoDesnowing](https://github.com/haoyuc/VideoDesnowing) dataset was used as the foundation. From this dataset, **22 distinct driving scenarios** were separated, each containing different environmental settings, camera perspectives, and in-car visual compositions. Based on the clean reference images, additional **synthetic adverse-weather dataset** was generated. Rainy images were synthesized using two distinct rain-generation models. [SyRaGAN](https://github.com/jaewoong1/SyRa-Synthesized_Rain_dataset) was applied to generate rain streaks with varying directions and densities without losing the consistency between streaks, while [VRGNet](https://github.com/hongwang01/VRGNet) was used to produce the broader atmospheric rain appearance at different density levels. Foggy images were generated using [FINet](https://github.com/zhangzhengde0225/FINet) under varying depth and density settings. The resulting dataset was further augmented through **augmentation methods** to increase sample diversity and improve the robustness and generalization performance of the model.
 
 ## Dataset Samples
 
@@ -78,7 +78,7 @@ The primary objective is to recover visually clean images while preserving scene
 ---
 
 
-## Dataset Structure
+## Dataset Folder Path
 
 ```text
 data/
